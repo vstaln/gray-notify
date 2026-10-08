@@ -1,8 +1,12 @@
-//! gray-notify — a gray sidecar plugin.
+//! gray-notify — terminal/desktop notification when the agent settles.
 //!
-//! With no arguments it speaks gray's NDJSON wire protocol on stdio: one JSON
-//! request per stdin line, one reply per stdout line. `gray-notify manifest`
-//! prints the manifest for humans and `gray account check`.
+//! Port of pi's `notify` extension: on every `turn_end` event the sidecar
+//! emits a notification — OSC 99 for Kitty, OSC 777 for Ghostty/iTerm2/
+//! WezTerm/rxvt (written to /dev/tty, since stdout is the JSON wire), a
+//! Windows toast under `WT_SESSION`, and `notify-send` as a fallback or
+//! when `GRAY_NOTIFY_SEND=1` asks for the desktop popup too.
+//!
+//! `/notify` reports status; `/notify test` fires one immediately.
 
 use std::io::{BufRead, Write};
 
@@ -13,40 +17,143 @@ fn manifest() -> Value {
         "name": "notify",
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
-        "tools": [{
-            "name": "notify_hello",
-            "description": "Example tool from the gray-account template: greets `name`. Replace me.",
-            "parameters": {
-                "type": "object",
-                "properties": { "name": { "type": "string", "description": "Who to greet." } },
-                "required": ["name"]
-            }
-        }],
+        "tools": [],
         "commands": ["/notify"],
     })
 }
 
-/// A tool call. Return `Ok(text)` for the model, `Err(text)` for a tool error.
-fn call_tool(name: &str, args: &Value) -> Result<String, String> {
-    match name {
-        "notify_hello" => {
-            let who = args.get("name").and_then(Value::as_str).unwrap_or("").trim();
-            if who.is_empty() {
-                return Err("missing required argument: name".into());
-            }
-            Ok(format!("hello, {who}!"))
+/// Write a string to the controlling terminal, bypassing the NDJSON stdout
+/// wire. Returns false when no tty is reachable (headless cron runs).
+fn tty_write(s: &str) -> bool {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .and_then(|mut f| f.write_all(s.as_bytes()).and_then(|_| f.flush()))
+        .is_ok()
+}
+
+fn windows_toast(title: &str, body: &str) -> bool {
+    let ty = "Windows.UI.Notifications";
+    let script = format!(
+        "[{ty}.ToastNotificationManager, {ty}, ContentType = WindowsRuntime] > $null; \
+         $xml = [{ty}.ToastNotificationManager]::GetTemplateContent(\
+         [{ty}.ToastTemplateType]::ToastText01); \
+         $xml.GetElementsByTagName('text')[0].AppendChild($xml.CreateTextNode('{body}')) > $null; \
+         [{ty}.ToastNotification]::CreateToastNotifier('{title}').Show($xml)"
+    );
+    std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+fn notify_send(title: &str, body: &str) -> bool {
+    std::process::Command::new("notify-send")
+        .args([title, body])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// Escape OSC payloads: strip ESC and BEL so a hostile body can't break out.
+fn osc_safe(s: &str) -> String {
+    s.chars().filter(|c| *c != '\x1b' && *c != '\x07').collect()
+}
+
+/// Fire the notification through every channel that applies. Returns the
+/// list of channels that succeeded (for `/notify` status output).
+fn notify(title: &str, body: &str) -> Vec<&'static str> {
+    let mut used = Vec::new();
+    let title = osc_safe(title);
+    let body = osc_safe(body);
+    let tty_ok = if std::env::var_os("WT_SESSION").is_some() {
+        if windows_toast(&title, &body) {
+            used.push("windows-toast");
+            true
+        } else {
+            false
         }
-        other => Err(format!("unknown tool: {other}")),
+    } else if std::env::var_os("KITTY_WINDOW_ID").is_some() {
+        if tty_write(&format!("\x1b]99;i=1:d=0;{title}\x1b\\"))
+            && tty_write(&format!("\x1b]99;i=1:p=body;{body}\x1b\\"))
+        {
+            used.push("osc99");
+            true
+        } else {
+            false
+        }
+    } else {
+        if tty_write(&format!("\x1b]777;notify;{title};{body}\x07")) {
+            used.push("osc777");
+            true
+        } else {
+            false
+        }
+    };
+    // Desktop popup only when explicitly enabled: headless runs (cron,
+    // `gray -p` subagents) have no tty and would spam the desktop.
+    let want_send = std::env::var("GRAY_NOTIFY_SEND")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if want_send && notify_send(&title, &body) {
+        used.push("notify-send");
+    }
+    used
+}
+
+fn on_turn_end() {
+    notify("gray", "ready for input");
+}
+
+/// `/notify …` — `argv` excludes the command name.
+fn run_command(argv: &[&str]) -> String {
+    match argv.first().copied() {
+        Some("test") => {
+            let used = notify("gray-notify", "test notification");
+            if used.is_empty() {
+                "no notification channel worked (headless? try GRAY_NOTIFY_SEND=1)".into()
+            } else {
+                format!("sent via {}", used.join(", "))
+            }
+        }
+        Some("on") | Some("off") => {
+            let dir = dirs_state();
+            let flag = dir.join("disabled");
+            let res = if argv[0] == "off" {
+                std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&flag, b""))
+            } else {
+                std::fs::remove_file(&flag).or_else(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
+                })
+            };
+            match res {
+                Ok(()) => format!("notifications {}", if argv[0] == "off" { "off" } else { "on" }),
+                Err(e) => format!("couldn't flip state: {e}"),
+            }
+        }
+        _ => format!(
+            "gray-notify {} — notifies on turn_end via OSC 777/99, Windows toast, notify-send. \
+             /notify test · /notify on|off",
+            env!("CARGO_PKG_VERSION")
+        ),
     }
 }
 
-/// A slash command typed by the user (`/notify …`). `argv` excludes the name.
-fn run_command(argv: &[&str]) -> String {
-    if argv.is_empty() {
-        format!("notify {} — edit src/main.rs to make me useful", env!("CARGO_PKG_VERSION"))
-    } else {
-        format!("notify got: {}", argv.join(" "))
-    }
+fn dirs_state() -> std::path::PathBuf {
+    let home = std::env::var_os("GRAY_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".gray")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join("notify")
+}
+
+fn enabled() -> bool {
+    !dirs_state().join("disabled").exists()
 }
 
 /// One request → `Some(reply)`, or `None` for notifications. The bool asks
@@ -56,18 +163,15 @@ fn handle(req: &Value) -> (Option<Value>, bool) {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let Some(id) = id else {
+        if method == "event/notify" && enabled() {
+            if params.get("type").and_then(Value::as_str) == Some("turn_end") {
+                on_turn_end();
+            }
+        }
         return (None, method == "plugin/shutdown");
     };
     let result = match method {
         "plugin/manifest" => manifest(),
-        "tool/call" => {
-            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let args = params.get("args").cloned().unwrap_or(Value::Null);
-            match call_tool(name, &args) {
-                Ok(text) => json!({ "content": text }),
-                Err(text) => json!({ "content": text, "is_error": true }),
-            }
-        }
         "command/run" => {
             let argv: Vec<&str> = params
                 .get("argv")
@@ -116,35 +220,36 @@ mod tests {
     }
 
     #[test]
-    fn manifest_names_the_plugin_and_its_version() {
+    fn manifest_has_no_tools_and_one_command() {
         let m = call("plugin/manifest", Value::Null)["result"].clone();
         assert_eq!(m["name"], "notify");
-        assert_eq!(m["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(m["commands"], json!(["/notify"]));
+        assert_eq!(m["tools"], json!([]));
     }
 
     #[test]
-    fn tool_call_returns_content() {
-        let r = call("tool/call", json!({ "name": "notify_hello", "args": { "name": "gray" } }));
-        assert_eq!(r["result"]["content"], "hello, gray!");
-        assert!(r["result"].get("is_error").is_none());
+    fn notifications_are_silent_and_dont_exit() {
+        let (reply, exit) = handle(&json!({
+            "method": "event/notify",
+            "params": {"type": "turn_end", "usage": {}, "session": {}}
+        }));
+        assert!(reply.is_none() && !exit);
     }
 
     #[test]
-    fn tool_errors_are_flagged() {
-        let r = call("tool/call", json!({ "name": "notify_hello", "args": {} }));
-        assert_eq!(r["result"]["is_error"], true);
-    }
-
-    #[test]
-    fn unknown_methods_are_method_not_found() {
-        assert_eq!(call("nope", Value::Null)["error"]["code"], -32601);
-    }
-
-    #[test]
-    fn shutdown_replies_then_exits_and_notifications_are_silent() {
+    fn shutdown_replies_then_exits() {
         let (reply, exit) = handle(&json!({ "id": 2, "method": "plugin/shutdown" }));
         assert!(reply.is_some() && exit);
-        let (reply, exit) = handle(&json!({ "method": "plugin/shutdown" }));
-        assert!(reply.is_none() && exit);
+    }
+
+    #[test]
+    fn osc_escapes_control_chars() {
+        assert_eq!(osc_safe("a\x1b]8;;x\x07b"), "a]8;;xb");
+    }
+
+    #[test]
+    fn notify_command_reports_version() {
+        let r = call("command/run", json!({ "name": "/notify", "argv": [] }));
+        assert!(r["result"]["text"].as_str().unwrap().contains("gray-notify"));
     }
 }
