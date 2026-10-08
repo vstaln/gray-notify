@@ -1,6 +1,6 @@
 //! gray-notify — terminal/desktop notification when the agent settles.
 //!
-//! Port of pi's `notify` extension: on every `turn_end` event the sidecar
+//! On every `turn_end` event the sidecar
 //! emits a notification — OSC 99 for Kitty, OSC 777 for Ghostty/iTerm2/
 //! WezTerm/rxvt (written to /dev/tty, since stdout is the JSON wire), a
 //! Windows toast under `WT_SESSION`, and `notify-send` as a fallback or

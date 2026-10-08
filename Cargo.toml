@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
-description = "Desktop/terminal notification when the agent settles (OSC 777/99, notify-send). Port of pi's notify extension."
+description = "Desktop/terminal notification when the agent settles (OSC 777/99, notify-send)."
 
 [[bin]]
 name = "gray-notify"
