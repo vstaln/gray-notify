@@ -25,9 +25,15 @@ fn manifest() -> Value {
 /// Write a string to the controlling terminal, bypassing the NDJSON stdout
 /// wire. Returns false when no tty is reachable (headless cron runs).
 fn tty_write(s: &str) -> bool {
+    // CONOUT$ is the Windows console device — same "controlling terminal,
+    // bypassing stdout" semantics as /dev/tty on unix.
+    #[cfg(windows)]
+    const TTY: &str = "CONOUT$";
+    #[cfg(not(windows))]
+    const TTY: &str = "/dev/tty";
     std::fs::OpenOptions::new()
         .write(true)
-        .open("/dev/tty")
+        .open(TTY)
         .and_then(|mut f| f.write_all(s.as_bytes()).and_then(|_| f.flush()))
         .is_ok()
 }
@@ -60,6 +66,29 @@ fn notify_send(title: &str, body: &str) -> bool {
         .is_ok()
 }
 
+/// macOS has no notify-send; osascript is the built-in desktop-popup path.
+#[cfg(target_os = "macos")]
+fn mac_notify(title: &str, body: &str) -> bool {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        esc(body),
+        esc(title)
+    );
+    std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mac_notify(_: &str, _: &str) -> bool {
+    false
+}
+
 /// Escape OSC payloads: strip ESC and BEL so a hostile body can't break out.
 fn osc_safe(s: &str) -> String {
     s.chars().filter(|c| *c != '\x1b' && *c != '\x07').collect()
@@ -71,7 +100,7 @@ fn notify(title: &str, body: &str) -> Vec<&'static str> {
     let mut used = Vec::new();
     let title = osc_safe(title);
     let body = osc_safe(body);
-    let tty_ok = if std::env::var_os("WT_SESSION").is_some() {
+    let _tty_ok = if std::env::var_os("WT_SESSION").is_some() {
         if windows_toast(&title, &body) {
             used.push("windows-toast");
             true
@@ -100,8 +129,12 @@ fn notify(title: &str, body: &str) -> Vec<&'static str> {
     let want_send = std::env::var("GRAY_NOTIFY_SEND")
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    if want_send && notify_send(&title, &body) {
-        used.push("notify-send");
+    if want_send {
+        if notify_send(&title, &body) {
+            used.push("notify-send");
+        } else if mac_notify(&title, &body) {
+            used.push("osascript");
+        }
     }
     used
 }
@@ -147,7 +180,7 @@ fn run_command(argv: &[&str]) -> String {
 fn dirs_state() -> std::path::PathBuf {
     let home = std::env::var_os("GRAY_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".gray")))
+        .or_else(|| std::env::home_dir().map(|h| h.join(".gray")))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     home.join("notify")
 }
