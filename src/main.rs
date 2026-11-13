@@ -20,6 +20,7 @@ fn manifest() -> Value {
         "tools": [],
         "description": "desktop notification when the agent settles",
         "commands": ["/notify"],
+        "command_descriptions": {"/notify": "check or test turn-end notifications"},
     })
 }
 
