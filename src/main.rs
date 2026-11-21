@@ -163,11 +163,18 @@ fn run_command(argv: &[&str]) -> String {
                 std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&flag, b""))
             } else {
                 std::fs::remove_file(&flag).or_else(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
                 })
             };
             match res {
-                Ok(()) => format!("notifications {}", if argv[0] == "off" { "off" } else { "on" }),
+                Ok(()) => format!(
+                    "notifications {}",
+                    if argv[0] == "off" { "off" } else { "on" }
+                ),
                 Err(e) => format!("couldn't flip state: {e}"),
             }
         }
@@ -233,7 +240,9 @@ fn main() -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
         let line = line?;
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let (reply, exit) = handle(&req);
         if let Some(reply) = reply {
             writeln!(stdout, "{reply}")?;
@@ -251,7 +260,9 @@ mod tests {
     use super::*;
 
     fn call(method: &str, params: Value) -> Value {
-        handle(&json!({ "id": 1, "method": method, "params": params })).0.unwrap()
+        handle(&json!({ "id": 1, "method": method, "params": params }))
+            .0
+            .unwrap()
     }
 
     #[test]
@@ -285,6 +296,11 @@ mod tests {
     #[test]
     fn notify_command_reports_version() {
         let r = call("command/run", json!({ "name": "/notify", "argv": [] }));
-        assert!(r["result"]["text"].as_str().unwrap().contains("gray-notify"));
+        assert!(
+            r["result"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("gray-notify")
+        );
     }
 }
