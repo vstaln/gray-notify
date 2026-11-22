@@ -205,10 +205,11 @@ fn handle(req: &Value) -> (Option<Value>, bool) {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let Some(id) = id else {
-        if method == "event/notify" && enabled() {
-            if params.get("type").and_then(Value::as_str) == Some("turn_end") {
-                on_turn_end();
-            }
+        if method == "event/notify"
+            && enabled()
+            && params.get("type").and_then(Value::as_str) == Some("turn_end")
+        {
+            on_turn_end();
         }
         return (None, method == "plugin/shutdown");
     };
